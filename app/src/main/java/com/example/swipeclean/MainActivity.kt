@@ -1,6 +1,10 @@
 package com.example.swipeclean
 
+import android.content.Context
+import android.net.Uri
 import android.os.Bundle
+import android.provider.DocumentsContract
+import android.text.format.Formatter
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -18,8 +22,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.documentfile.provider.DocumentFile
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -35,46 +39,78 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+class Scan(val uris: List<Uri>, val bytes: Long)
+
+// Lê só os metadados (nome, tipo, tamanho) em UMA consulta: não abre nenhuma foto
+fun scanFolder(ctx: Context, tree: Uri): Scan {
+    val docId = DocumentsContract.getTreeDocumentId(tree)
+    val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, docId)
+    val items = ArrayList<Pair<String, Uri>>()
+    var bytes = 0L
+    ctx.contentResolver.query(
+        children,
+        arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE
+        ),
+        null, null, null
+    )?.use { c ->
+        while (c.moveToNext()) {
+            if (c.getString(2)?.startsWith("image/") == true) {
+                items.add(c.getString(1) to DocumentsContract.buildDocumentUriUsingTree(tree, c.getString(0)))
+                if (!c.isNull(3)) bytes += c.getLong(3)
+            }
+        }
+    }
+    return Scan(items.sortedBy { it.first }.map { it.second }, bytes)
+}
+
 @Composable
 fun App() {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    var photos by remember { mutableStateOf<List<DocumentFile>>(emptyList()) }
+    var photos by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var index by remember { mutableIntStateOf(0) }
     var started by remember { mutableStateOf(false) }
+    var loading by remember { mutableStateOf(false) }
+    var pending by remember { mutableStateOf<Scan?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
 
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
     ) { uri ->
         if (uri != null) {
             scope.launch {
-                photos = withContext(Dispatchers.IO) {
-                    DocumentFile.fromTreeUri(ctx, uri)?.listFiles()
-                        ?.filter { it.type?.startsWith("image/") == true }
-                        ?.sortedBy { it.name } ?: emptyList()
+                loading = true
+                error = null
+                try {
+                    pending = withContext(Dispatchers.IO) { scanFolder(ctx, uri) }
+                } catch (e: Exception) {
+                    pending = null
+                    error = e.message ?: "Erro ao ler a pasta"
                 }
-                index = 0
-                started = true
+                loading = false
             }
         }
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         val photo = photos.getOrNull(index)
-        if (photo == null) {
+        val scan = pending
+        if (loading) {
             Column(
                 Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.Center,
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                if (started) {
-                    Text("Fim!", style = MaterialTheme.typography.headlineMedium)
-                    Spacer(Modifier.height(16.dp))
-                }
-                Button(onClick = { picker.launch(null) }) { Text("Selecionar pasta") }
+                CircularProgressIndicator()
+                Spacer(Modifier.height(16.dp))
+                Text("Contando fotos...")
             }
-        } else {
-            val offsetX = remember(photo.uri) { Animatable(0f) }
+        } else if (photo != null) {
+            val offsetX = remember(photo) { Animatable(0f) }
             val x = offsetX.value
             val tint = if (x > 0) Color.Red else Color.Green
             val alpha = (abs(x) / 800f).coerceIn(0f, 0.5f)
@@ -83,14 +119,18 @@ fun App() {
                 Modifier
                     .fillMaxSize()
                     .background(tint.copy(alpha = alpha))
-                    .pointerInput(photo.uri) {
+                    .pointerInput(photo) {
                         detectHorizontalDragGestures(
                             onDragEnd = {
                                 scope.launch {
                                     when {
                                         offsetX.value > 300f -> {
                                             offsetX.animateTo(2000f)
-                                            withContext(Dispatchers.IO) { photo.delete() }
+                                            withContext(Dispatchers.IO) {
+                                                try {
+                                                    DocumentsContract.deleteDocument(ctx.contentResolver, photo)
+                                                } catch (e: Exception) { }
+                                            }
                                             photos = photos.toMutableList().also { it.removeAt(index) }
                                         }
                                         offsetX.value < -300f -> {
@@ -110,7 +150,7 @@ fun App() {
                     }
             ) {
                 AsyncImage(
-                    model = photo.uri,
+                    model = photo,
                     contentDescription = null,
                     contentScale = ContentScale.Fit,
                     modifier = Modifier
@@ -124,6 +164,51 @@ fun App() {
                     "${index + 1}/${photos.size}",
                     modifier = Modifier.align(Alignment.TopCenter).padding(16.dp)
                 )
+            }
+        } else if (scan != null) {
+            // Tela de confirmação: mostra quantas fotos tem antes de começar
+            Column(
+                Modifier.fillMaxSize().padding(24.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                if (scan.uris.isEmpty()) {
+                    Text("Nenhuma foto nesta pasta", style = MaterialTheme.typography.headlineSmall)
+                } else {
+                    Text(
+                        "${scan.uris.size} fotos",
+                        style = MaterialTheme.typography.headlineLarge
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(Formatter.formatFileSize(ctx, scan.bytes))
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        "Direita apaga (permanente)\nEsquerda mantém",
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(Modifier.height(24.dp))
+                    Button(onClick = {
+                        photos = scan.uris
+                        index = 0
+                        started = true
+                        pending = null
+                    }) { Text("Começar") }
+                    Spacer(Modifier.height(8.dp))
+                }
+                OutlinedButton(onClick = { picker.launch(null) }) { Text("Escolher outra pasta") }
+            }
+        } else {
+            Column(
+                Modifier.fillMaxSize().padding(24.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                val msg = error ?: if (started) "Fim!" else null
+                if (msg != null) {
+                    Text(msg, style = MaterialTheme.typography.headlineSmall)
+                    Spacer(Modifier.height(16.dp))
+                }
+                Button(onClick = { picker.launch(null) }) { Text("Selecionar pasta") }
             }
         }
     }
